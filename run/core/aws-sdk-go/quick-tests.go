@@ -25,10 +25,11 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"os"
+	"runtime"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -85,29 +86,39 @@ func (f *mintJSONFormatter) Format(entry *log.Entry) ([]byte, error) {
 	return append(serialized, '\n'), nil
 }
 
+func cleanEmptyEntries(fields log.Fields) log.Fields {
+	cleanFields := log.Fields{}
+	for k, v := range fields {
+		if v != "" {
+			cleanFields[k] = v
+		}
+	}
+	return cleanFields
+}
+
 // log successful test runs
-func successLogger(function string, args map[string]interface{}, startTime time.Time) *log.Entry {
+func successLogger(testName string, function string, args map[string]interface{}, startTime time.Time) *log.Entry {
 	// calculate the test case duration
 	duration := time.Since(startTime)
 	// log with the fields as per mint
-	fields := log.Fields{"name": "aws-sdk-go", "function": function, "args": args, "duration": duration.Nanoseconds() / 1000000, "status": "pass"}
-	return log.WithFields(fields)
+	fields := log.Fields{"name": "aws-sdk-go: " + testName, "function": function, "args": args, "duration": duration.Nanoseconds() / 1000000, "status": "PASS"}
+	return log.WithFields(cleanEmptyEntries(fields))
 }
 
 // log failed test runs
-func failureLog(function string, args map[string]interface{}, startTime time.Time, alert string, message string, err error) *log.Entry {
+func failureLog(testName string, function string, args map[string]interface{}, startTime time.Time, alert string, message string, err error) *log.Entry {
 	// calculate the test case duration
 	duration := time.Since(startTime)
 	var fields log.Fields
 	// log with the fields as per mint
 	if err != nil {
-		fields = log.Fields{"name": "aws-sdk-go", "function": function, "args": args,
-			"duration": duration.Nanoseconds() / 1000000, "status": "fail", "alert": alert, "message": message, "error": err}
+		fields = log.Fields{"name": "aws-sdk-go: " + testName, "function": function, "args": args,
+			"duration": duration.Nanoseconds() / 1000000, "status": "FAIL", "alert": alert, "message": message, "error": err}
 	} else {
-		fields = log.Fields{"name": "aws-sdk-go", "function": function, "args": args,
-			"duration": duration.Nanoseconds() / 1000000, "status": "fail", "alert": alert, "message": message}
+		fields = log.Fields{"name": "aws-sdk-go: " + testName, "function": function, "args": args,
+			"duration": duration.Nanoseconds() / 1000000, "status": "FAIL", "alert": alert, "message": message}
 	}
-	return log.WithFields(fields)
+	return log.WithFields(cleanEmptyEntries(fields))
 }
 
 func randString(n int, src rand.Source, prefix string) string {
@@ -127,10 +138,35 @@ func randString(n int, src rand.Source, prefix string) string {
 	return prefix + string(b[0:30-len(prefix)])
 }
 
-func testPresignedPut(s3Client *s3.S3) {
+func cleanup(s3Client *s3.S3, bucket string, object string, testName string,
+	function string, args map[string]interface{}, startTime time.Time) {
+
+	// Deleting the object, just in case it was created. Will not check for errors.
+	s3Client.DeleteObject(&s3.DeleteObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(object),
+	})
+
+	_, err := s3Client.DeleteBucket(&s3.DeleteBucketInput{
+		Bucket: aws.String(bucket),
+	})
+	if err != nil {
+		failureLog(testName, function, args, startTime, "", "AWS SDK Go DeleteBucket Failed", err).Fatal()
+		return
+	}
+
+}
+
+func getFuncName() string {
+	pc, _, _, _ := runtime.Caller(1)
+	return strings.TrimPrefix(runtime.FuncForPC(pc).Name(), "main.")
+}
+
+func testPresignedPutInvalidHash(s3Client *s3.S3) {
 	startTime := time.Now()
 	function := "PresignedPut"
-	bucket := randString(60, rand.NewSource(time.Now().UnixNano()), "aws-sdk-go-test")
+	testName := getFuncName()
+	bucket := randString(60, rand.NewSource(time.Now().UnixNano()), "aws-sdk-go-test-")
 	object := "presignedTest"
 	expiry := 1 * time.Minute
 	args := map[string]interface{}{
@@ -138,6 +174,15 @@ func testPresignedPut(s3Client *s3.S3) {
 		"objectName": object,
 		"expiry":     expiry,
 	}
+
+	_, err := s3Client.CreateBucket(&s3.CreateBucketInput{
+		Bucket: aws.String(bucket),
+	})
+	if err != nil {
+		failureLog(testName, function, args, startTime, "", "AWS SDK Go CreateBucket Failed", err).Fatal()
+		return
+	}
+	defer cleanup(s3Client, bucket, object, testName, function, args, startTime)
 
 	req, _ := s3Client.PutObjectRequest(&s3.PutObjectInput{
 		Bucket:      aws.String(bucket),
@@ -148,7 +193,7 @@ func testPresignedPut(s3Client *s3.S3) {
 	req.HTTPRequest.Header.Set("X-Amz-Content-Sha256", "invalid-sha256")
 	url, err := req.Presign(expiry)
 	if err != nil {
-		failureLog(function, args, startTime, "", "AWS SDK Go presigned Put request creation failed", err).Fatal()
+		failureLog(testName, function, args, startTime, "", "AWS SDK Go presigned Put request creation failed", err).Fatal()
 		return
 	}
 
@@ -158,28 +203,25 @@ func testPresignedPut(s3Client *s3.S3) {
 
 	resp, err := http.DefaultClient.Do(rreq)
 	if err != nil {
-		failureLog(function, args, startTime, "", "AWS SDK Go presigned put request failed", err).Fatal()
+		failureLog(testName, function, args, startTime, "", "AWS SDK Go presigned put request failed", err).Fatal()
 		return
 	}
-	body, err := ioutil.ReadAll(resp.Body)
-	resp.Body.Close()
-	if err != nil {
-		failureLog(function, args, startTime, "", "AWS SDK Go reading response body failed", err).Fatal()
-		return
-	}
+	defer resp.Body.Close()
 
+	dec := xml.NewDecoder(resp.Body)
 	errResp := ErrorResponse{}
-	err = xml.Unmarshal(body, &errResp)
+	err = dec.Decode(&errResp)
 	if err != nil {
-		failureLog(function, args, startTime, "", "AWS SDK Go unmarshalling xml failed", err).Fatal()
+		failureLog(testName, function, args, startTime, "", "AWS SDK Go unmarshalling xml failed", err).Fatal()
 		return
 	}
 
 	if errResp.Code != "XAmzContentSHA256Mismatch" {
-		failureLog(function, args, startTime, "", fmt.Sprintf("AWS SDK Go presigned PUT expected to fail with XAmzContentSHA256Mismatch but got %v", errResp.Code), errors.New("AWS S3 error code mismatch")).Fatal()
+		failureLog(testName, function, args, startTime, "", fmt.Sprintf("AWS SDK Go presigned PUT expected to fail with XAmzContentSHA256Mismatch but got %v", errResp.Code), errors.New("AWS S3 error code mismatch")).Fatal()
 		return
 	}
-	successLogger(function, args, startTime).Info()
+
+	successLogger(testName, function, args, startTime).Info()
 }
 
 func main() {
@@ -189,7 +231,7 @@ func main() {
 	secure := os.Getenv("ENABLE_HTTPS")
 	sdkEndpoint := "http://" + endpoint
 	if secure == "1" {
-		sdkEndpoint = "https://"
+		sdkEndpoint = "https://" + endpoint
 	}
 
 	creds := credentials.NewStaticCredentials(accessKey, secretKey, "")
@@ -200,8 +242,6 @@ func main() {
 		Region:           aws.String("us-east-1"),
 		S3ForcePathStyle: aws.Bool(true),
 	}
-
-	s3Config = s3Config.WithLogLevel(aws.LogDebug)
 
 	// Create an S3 service object in the default region.
 	s3Client := s3.New(newSession, s3Config)
@@ -215,5 +255,5 @@ func main() {
 	// log Info or above -- success cases are Info level, failures are Fatal level
 	log.SetLevel(log.InfoLevel)
 	// execute tests
-	testPresignedPut(s3Client)
+	testPresignedPutInvalidHash(s3Client)
 }
